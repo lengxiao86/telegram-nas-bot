@@ -18,6 +18,9 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").rstrip("/")
 SAVE_SUBDIR = os.environ.get("SAVE_SUBDIR", "Telegram Videos").strip("/")
 MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MAX_CONCURRENT_TRANSFERS", "2")))
+# A Local Bot API request can wait while Telegram transfers a multi-GB video
+# to the NAS. The library default is too short for that first getFile call.
+REQUEST_READ_TIMEOUT = float(os.environ.get("TELEGRAM_REQUEST_READ_TIMEOUT", "900"))
 ALLOWED_IDS = {int(item) for item in os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").split(",") if item.strip()}
 SAVE_DIR = Path("/data") / SAVE_SUBDIR
 
@@ -72,7 +75,13 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("请先在 .env 中设置 TELEGRAM_BOT_TOKEN")
-    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(16)
+    builder = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(16)
+        .connect_timeout(30)
+        .read_timeout(REQUEST_READ_TIMEOUT)
+    )
     if LOCAL_BOT_API_URL:
         # Local mode has no cloud Bot API download cap.  Both containers share
         # the Local Bot API data volume, so returned local file paths are valid.
