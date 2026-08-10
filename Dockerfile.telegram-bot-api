@@ -1,0 +1,16 @@
+# Builds Telegram's official Local Bot API Server from TDLib's source.
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates cmake g++ git gperf libssl-dev make zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --recursive https://github.com/tdlib/telegram-bot-api.git /src
+WORKDIR /src
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=/usr/local \
+    && cmake --build build --target install -j"$(nproc)"
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+ENTRYPOINT ["telegram-bot-api"]
