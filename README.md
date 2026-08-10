@@ -53,6 +53,8 @@ docker compose down
 
 向机器人发送视频（或以文件形式发送视频），它会回复「已保存」，文件会出现在 NAS 挂载共享目录下的 `Telegram Videos` 子文件夹中。文件名自动加入时间，避免覆盖。
 
+连续发送多个大视频时，机器人会先回复「已接收，正在排队」，默认同时处理 2 个视频，其他视频会安全等待。若 NAS 网络和硬盘性能较好，可在 `.env` 将 `MAX_CONCURRENT_TRANSFERS` 调高；大多数 NAS 建议保持 `2`。
+
 ## 大视频说明
 
 - 本项目已启用 Local Bot API Server，因此不会受官方云端 Bot API 的 **20 MB 下载限制**影响。

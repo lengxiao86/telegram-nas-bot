@@ -42,6 +42,7 @@ umask 077
   printf 'NAS_VIDEO_DIR=%s\n' "$video_dir"
   printf 'ALLOWED_TELEGRAM_USER_IDS=%s\n' "$allowed_id"
   printf 'SAVE_SUBDIR=Telegram Videos\n'
+  printf 'MAX_CONCURRENT_TRANSFERS=2\n'
 } > .env
 
 echo "Building Telegram Local Bot API Server. First build can take several minutes…"

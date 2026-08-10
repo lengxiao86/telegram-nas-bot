@@ -16,14 +16,16 @@ LOG = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").rstrip("/")
 SAVE_SUBDIR = os.environ.get("SAVE_SUBDIR", "Telegram Videos").strip("/")
+MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MAX_CONCURRENT_TRANSFERS", "2")))
 ALLOWED_IDS = {int(item) for item in os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").split(",") if item.strip()}
 SAVE_DIR = Path("/data") / SAVE_SUBDIR
 
 
-def safe_name(original: str) -> str:
+def safe_name(original: str, message_id: int) -> str:
     stem = re.sub(r'[\\/:*?"<>|#%]', "_", Path(original).stem).strip() or "video"
     suffix = re.sub(r"[^.A-Za-z0-9]", "", Path(original).suffix) or ".mp4"
-    return f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}{suffix}"
+    # Telegram message IDs are unique in the chat, unlike second-level times.
+    return f"{stem}_{message_id}_{time.strftime('%Y%m%d_%H%M%S')}{suffix}"
 
 
 def is_authorized(update: Update) -> bool:
@@ -48,11 +50,16 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
     original_name = getattr(attachment, "file_name", None) or "telegram_video.mp4"
-    destination = SAVE_DIR / safe_name(original_name)
-    status = await message.reply_text("正在保存到 NAS…")
+    destination = SAVE_DIR / safe_name(original_name, message.message_id)
+    status = await message.reply_text("已接收，正在排队保存到 NAS…")
     try:
-        file = await context.bot.get_file(attachment.file_id)
-        await file.download_to_drive(custom_path=destination)
+        # Keep a small, configurable number of large transfers in flight; this
+        # protects NAS disk/network throughput while later videos wait safely.
+        semaphore = context.application.bot_data["transfer_semaphore"]
+        async with semaphore:
+            await status.edit_text("正在保存到 NAS…")
+            file = await context.bot.get_file(attachment.file_id)
+            await file.download_to_drive(custom_path=destination)
         await status.edit_text(f"已保存：{destination.name}")
         LOG.info("Saved %s", destination)
     except Exception:
@@ -64,12 +71,13 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("请先在 .env 中设置 TELEGRAM_BOT_TOKEN")
-    builder = Application.builder().token(BOT_TOKEN)
+    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(16)
     if LOCAL_BOT_API_URL:
         # Local mode has no cloud Bot API download cap.  Both containers share
         # the Local Bot API data volume, so returned local file paths are valid.
         builder = builder.base_url(f"{LOCAL_BOT_API_URL}/bot").base_file_url(f"{LOCAL_BOT_API_URL}/file/bot").local_mode(True)
     app = builder.build()
+    app.bot_data["transfer_semaphore"] = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, save_video))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
