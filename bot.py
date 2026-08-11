@@ -1,6 +1,7 @@
 """Telegram video -> local NAS folder bot."""
 import asyncio
 import hashlib
+import io
 import logging
 import os
 import re
@@ -148,7 +149,7 @@ async def deny_if_needed(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny_if_needed(update):
         return
-    await update.effective_message.reply_text("把视频发给我，我会保存到 NAS。可用命令：/status、/recent")
+    await update.effective_message.reply_text("把视频发给我，我会保存到 NAS。可用命令：/status、/recent、/dedupe_report")
 
 
 def recent_lines(store: StateStore, limit: int) -> list[str]:
@@ -159,6 +160,51 @@ def recent_lines(store: StateStore, limit: int) -> list[str]:
         f"{index}. {Path(row['path']).name} · {readable_size(row['size'])} · {datetime.fromtimestamp(row['saved_at']).strftime('%m-%d %H:%M')}"
         for index, row in enumerate(rows, 1)
     ]
+
+
+def scan_duplicate_videos(root: Path) -> tuple[int, int, list[list[Path]]]:
+    """Return video count, reclaimable bytes, and exact-duplicate file groups."""
+    by_size: dict[int, list[Path]] = {}
+    video_count = 0
+    for directory, _, names in os.walk(root):
+        for name in names:
+            candidate = Path(directory) / name
+            if candidate.is_symlink() or candidate.suffix.lower() not in MEDIA_SUFFIXES:
+                continue
+            with suppress(OSError):
+                by_size.setdefault(candidate.stat().st_size, []).append(candidate)
+                video_count += 1
+
+    by_hash: dict[str, list[Path]] = {}
+    for candidates in by_size.values():
+        if len(candidates) < 2:
+            continue
+        for candidate in candidates:
+            with suppress(OSError):
+                by_hash.setdefault(file_hash(candidate), []).append(candidate)
+
+    groups = [sorted(group, key=lambda path: (path.stat().st_mtime, str(path))) for group in by_hash.values() if len(group) > 1]
+    groups.sort(key=lambda group: group[0].stat().st_size * (len(group) - 1), reverse=True)
+    reclaimable = sum(group[0].stat().st_size * (len(group) - 1) for group in groups)
+    return video_count, reclaimable, groups
+
+
+def duplicate_report_text(video_count: int, reclaimable: int, groups: list[list[Path]]) -> str:
+    lines = [
+        "Telegram NAS Bot - 精确重复视频报告",
+        f"扫描目录：{SAVE_DIR}",
+        f"扫描视频：{video_count}",
+        f"重复组数：{len(groups)}",
+        f"可释放空间：{readable_size(reclaimable)}",
+        "",
+        "说明：依据 SHA-256 文件内容检测；本报告不会移动或删除文件。",
+    ]
+    for number, group in enumerate(groups, 1):
+        original = group[0].relative_to(SAVE_DIR)
+        size = readable_size(group[0].stat().st_size)
+        lines.extend(["", f"重复组 {number}（每个 {size}）", f"保留建议：{original}"])
+        lines.extend(f"重复副本：{path.relative_to(SAVE_DIR)}" for path in group[1:])
+    return "\n".join(lines) + "\n"
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,6 +225,33 @@ async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny_if_needed(update):
         return
     await update.effective_message.reply_text("最近保存的 10 个文件：\n" + "\n".join(recent_lines(context.application.bot_data["store"], 10)))
+
+
+async def dedupe_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny_if_needed(update):
+        return
+    lock: asyncio.Lock = context.application.bot_data["dedupe_lock"]
+    if lock.locked():
+        await update.effective_message.reply_text("已有去重扫描正在执行，请等待其完成。")
+        return
+    async with lock:
+        progress = await update.effective_message.reply_text("正在扫描 NAS 文件夹中的视频并计算精确指纹，视频较多时可能需要几分钟…")
+        try:
+            video_count, reclaimable, groups = await asyncio.to_thread(scan_duplicate_videos, SAVE_DIR)
+            report = duplicate_report_text(video_count, reclaimable, groups)
+            await progress.edit_text(
+                f"扫描完成：共 {video_count} 个视频，发现 {len(groups)} 组精确重复文件，可释放 {readable_size(reclaimable)}。"
+            )
+            if groups:
+                payload = io.BytesIO(report.encode("utf-8"))
+                payload.name = f"dedupe-report-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+                await update.effective_message.reply_document(
+                    document=payload,
+                    caption="这是只读报告：未移动或删除任何文件。",
+                )
+        except Exception:
+            LOG.exception("Duplicate scan failed")
+            await progress.edit_text("去重扫描失败。请查看 NAS 容器日志，并确认保存文件夹可读。")
 
 
 async def download_with_retries(context: ContextTypes.DEFAULT_TYPE, attachment, destination: Path, status_message) -> None:
@@ -307,9 +380,11 @@ def main() -> None:
     app.bot_data["store"] = StateStore(STATE_DB)
     app.bot_data["tracker"] = TransferTracker()
     app.bot_data["transfer_semaphore"] = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
+    app.bot_data["dedupe_lock"] = asyncio.Lock()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("recent", recent))
+    app.add_handler(CommandHandler("dedupe_report", dedupe_report))
     app.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, save_video))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

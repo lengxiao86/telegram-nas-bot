@@ -57,6 +57,7 @@ docker compose down
 
 - `/status`：NAS 剩余空间、正在传输和排队数量、最近三个文件。
 - `/recent`：最近保存的十个文件。
+- `/dedupe_report`：递归扫描当前 NAS 保存目录的全部视频，按 SHA-256 生成精确重复报告与可释放空间；只报告，绝不移动或删除文件。
 
 机器人会依据 Telegram 文件唯一 ID 与文件 SHA-256 自动去重；失败会自动重试。Local Bot API 的旧视频缓存也会在默认 7 天后自动清理，可通过 `.env` 调整保留时间。
 
