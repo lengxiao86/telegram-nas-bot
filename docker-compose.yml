@@ -29,7 +29,8 @@ services:
     volumes:
       # Set NAS_VIDEO_DIR in .env. The right-hand /data must stay unchanged.
       - ${NAS_VIDEO_DIR}:/data
-      - telegram-api-data:/var/lib/telegram-bot-api:ro
+      # The bot removes only expired video cache files from this shared volume.
+      - telegram-api-data:/var/lib/telegram-bot-api
     depends_on:
       - telegram-bot-api
 
