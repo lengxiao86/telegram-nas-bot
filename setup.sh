@@ -41,7 +41,7 @@ umask 077
   printf 'TELEGRAM_API_HASH=%s\n' "$api_hash"
   printf 'NAS_VIDEO_DIR=%s\n' "$video_dir"
   printf 'ALLOWED_TELEGRAM_USER_IDS=%s\n' "$allowed_id"
-  printf 'SAVE_SUBDIR=Telegram Videos\n'
+  printf 'SAVE_SUBDIR=\n'
   printf 'MAX_CONCURRENT_TRANSFERS=2\n'
 } > .env
 
@@ -49,5 +49,5 @@ echo "Building Telegram Local Bot API Server. First build can take several minut
 docker compose up -d --build
 echo
 echo "Done. Send a video to your bot; it will be saved under:"
-echo "$video_dir/Telegram Videos"
+echo "$video_dir"
 echo "Logs: docker compose logs -f"

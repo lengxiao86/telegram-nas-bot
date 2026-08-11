@@ -22,7 +22,8 @@ LOG = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").rstrip("/")
-SAVE_SUBDIR = os.environ.get("SAVE_SUBDIR", "Telegram Videos").strip("/")
+# Empty by default: save straight into the NAS directory selected at setup.
+SAVE_SUBDIR = os.environ.get("SAVE_SUBDIR", "").strip("/")
 MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MAX_CONCURRENT_TRANSFERS", "2")))
 REQUEST_READ_TIMEOUT = float(os.environ.get("TELEGRAM_REQUEST_READ_TIMEOUT", "900"))
 DOWNLOAD_RETRIES = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "3")))
