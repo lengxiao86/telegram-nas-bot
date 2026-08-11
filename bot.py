@@ -31,6 +31,7 @@ DOWNLOAD_RETRIES = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "3")))
 RETRY_DELAY_SECONDS = max(1, int(os.environ.get("RETRY_DELAY_SECONDS", "15")))
 CACHE_RETENTION_HOURS = max(0, int(os.environ.get("CACHE_RETENTION_HOURS", "168")))
 CACHE_CLEAN_INTERVAL_MINUTES = max(1, int(os.environ.get("CACHE_CLEAN_INTERVAL_MINUTES", "60")))
+PROGRESS_UPDATE_SECONDS = max(1.0, float(os.environ.get("PROGRESS_UPDATE_SECONDS", "2")))
 ALLOWED_IDS = {int(item) for item in os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").split(",") if item.strip()}
 SAVE_DIR = Path("/data") / SAVE_SUBDIR
 CACHE_DIR = Path("/var/lib/telegram-bot-api")
@@ -109,30 +110,39 @@ class StateStore:
 
 class TransferTracker:
     def __init__(self) -> None:
-        self.waiting = 0
-        self.active = 0
+        self.tasks: dict[str, dict[str, int | bool]] = {}
         self.lock = asyncio.Lock()
 
-    async def enqueue(self) -> None:
+    async def enqueue(self, task_id: str, total: int) -> None:
         async with self.lock:
-            self.waiting += 1
+            self.tasks[task_id] = {"total": max(0, total), "completed": 0, "active": False}
 
-    async def start(self) -> None:
+    async def start(self, task_id: str) -> None:
         async with self.lock:
-            self.waiting -= 1
-            self.active += 1
+            if task_id in self.tasks:
+                self.tasks[task_id]["active"] = True
 
-    async def cancel_waiting(self) -> None:
+    async def progress(self, task_id: str, completed: int, total: int) -> dict[str, int]:
         async with self.lock:
-            self.waiting = max(0, self.waiting - 1)
+            if task_id in self.tasks:
+                self.tasks[task_id]["total"] = max(0, total)
+                self.tasks[task_id]["completed"] = max(0, min(completed, total))
+            return self._snapshot()
 
-    async def finish(self) -> None:
+    async def remove(self, task_id: str) -> None:
         async with self.lock:
-            self.active = max(0, self.active - 1)
+            self.tasks.pop(task_id, None)
 
-    async def snapshot(self) -> tuple[int, int]:
+    def _snapshot(self) -> dict[str, int]:
+        waiting = sum(1 for task in self.tasks.values() if not task["active"])
+        active = sum(1 for task in self.tasks.values() if task["active"])
+        total = sum(int(task["total"]) for task in self.tasks.values())
+        completed = sum(int(task["completed"]) for task in self.tasks.values())
+        return {"waiting": waiting, "active": active, "total": total, "completed": completed}
+
+    async def snapshot(self) -> dict[str, int]:
         async with self.lock:
-            return self.waiting, self.active
+            return self._snapshot()
 
 
 def is_authorized(update: Update) -> bool:
@@ -207,16 +217,46 @@ def duplicate_report_text(video_count: int, reclaimable: int, groups: list[list[
     return "\n".join(lines) + "\n"
 
 
+def duration_text(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {seconds} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分"
+
+
+def queue_text(snapshot: dict[str, int]) -> str:
+    line = f"队列：传输中 {snapshot['active']} · 等待 {snapshot['waiting']}"
+    if snapshot["total"] > 0:
+        percent = snapshot["completed"] * 100 / snapshot["total"]
+        line += f"\n总进度：{percent:.1f}%（{readable_size(snapshot['completed'])}/{readable_size(snapshot['total'])}）"
+    return line
+
+
+def transfer_progress_text(filename: str, completed: int, total: int, speed: float, snapshot: dict[str, int]) -> str:
+    percent = completed * 100 / total if total else 0
+    remaining = (total - completed) / speed if speed > 0 else 0
+    return (
+        f"正在写入 NAS：{filename}\n"
+        f"本视频：{percent:.1f}%（{readable_size(completed)}/{readable_size(total)}）\n"
+        f"速度：{readable_size(int(speed))}/s · 预计剩余：{duration_text(remaining)}\n"
+        + queue_text(snapshot)
+    )
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny_if_needed(update):
         return
     free = os.statvfs(SAVE_DIR).f_bavail * os.statvfs(SAVE_DIR).f_frsize
-    waiting, active = await context.application.bot_data["tracker"].snapshot()
+    queue = await context.application.bot_data["tracker"].snapshot()
     recent = recent_lines(context.application.bot_data["store"], 3)
     await update.effective_message.reply_text(
         "NAS 状态\n"
         f"剩余空间：{readable_size(free)}\n"
-        f"传输中：{active} · 排队中：{waiting}\n"
+        + queue_text(queue) + "\n"
         "最近保存：\n" + "\n".join(recent)
     )
 
@@ -254,13 +294,61 @@ async def dedupe_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await progress.edit_text("去重扫描失败。请查看 NAS 容器日志，并确认保存文件夹可读。")
 
 
-async def download_with_retries(context: ContextTypes.DEFAULT_TYPE, attachment, destination: Path, status_message) -> None:
+def copy_chunk(source, target) -> int:
+    block = source.read(4 * 1024 * 1024)
+    if block:
+        target.write(block)
+    return len(block)
+
+
+async def copy_local_file_with_progress(source_path: Path, destination: Path, task_id: str, filename: str, tracker: TransferTracker, status_message) -> None:
+    total = source_path.stat().st_size
+    completed = 0
+    started_at = last_at = time.monotonic()
+    last_completed = 0
+    with source_path.open("rb") as source, destination.open("wb") as target:
+        while True:
+            length = await asyncio.to_thread(copy_chunk, source, target)
+            if not length:
+                break
+            completed += length
+            now = time.monotonic()
+            if completed == total or now - last_at >= PROGRESS_UPDATE_SECONDS:
+                speed = (completed - last_completed) / max(now - last_at, 0.01)
+                snapshot = await tracker.progress(task_id, completed, total)
+                await status_message.edit_text(transfer_progress_text(filename, completed, total, speed, snapshot))
+                last_at, last_completed = now, completed
+        await asyncio.to_thread(target.flush)
+    # Ensure a final 100% update if the file size changed while it was copied.
+    if completed != last_completed:
+        snapshot = await tracker.progress(task_id, completed, total)
+        speed = completed / max(time.monotonic() - started_at, 0.01)
+        await status_message.edit_text(transfer_progress_text(filename, completed, total, speed, snapshot))
+
+
+async def download_with_retries(
+    context: ContextTypes.DEFAULT_TYPE,
+    attachment,
+    destination: Path,
+    task_id: str,
+    filename: str,
+    tracker: TransferTracker,
+    status_message,
+) -> None:
     last_error: Optional[Exception] = None
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
             destination.unlink(missing_ok=True)
+            snapshot = await tracker.snapshot()
+            await status_message.edit_text("正在从 Telegram 获取视频文件…\n" + queue_text(snapshot))
             telegram_file = await context.bot.get_file(attachment.file_id)
-            await telegram_file.download_to_drive(custom_path=destination)
+            source_path = Path(telegram_file.file_path) if LOCAL_BOT_API_URL and telegram_file.file_path else None
+            if source_path and source_path.is_file():
+                await copy_local_file_with_progress(source_path, destination, task_id, filename, tracker, status_message)
+            else:
+                # Non-local fallback: Telegram's remote API does not expose stream progress.
+                await telegram_file.download_to_drive(custom_path=destination)
+                await tracker.progress(task_id, destination.stat().st_size, destination.stat().st_size)
             return
         except Exception as error:  # Network/API failures are expected for large files.
             last_error = error
@@ -290,15 +378,16 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     destination = SAVE_DIR / safe_name(getattr(attachment, "file_name", None) or "telegram_video.mp4", message.message_id)
     status_message = await message.reply_text("已接收，正在排队保存到 NAS…")
     tracker: TransferTracker = context.application.bot_data["tracker"]
-    await tracker.enqueue()
+    task_id = f"{message.chat_id}:{message.message_id}"
+    filename = destination.name
+    await tracker.enqueue(task_id, getattr(attachment, "file_size", 0) or 0)
     started = False
     try:
         semaphore = context.application.bot_data["transfer_semaphore"]
         async with semaphore:
-            await tracker.start()
+            await tracker.start(task_id)
             started = True
-            await status_message.edit_text("正在保存到 NAS…")
-            await download_with_retries(context, attachment, destination, status_message)
+            await download_with_retries(context, attachment, destination, task_id, filename, tracker, status_message)
             digest = await asyncio.to_thread(file_hash, destination)
             duplicate = store.save(attachment.file_unique_id, digest, destination)
             if duplicate:
@@ -313,10 +402,7 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         detail = "网络请求超时" if isinstance(error, TimedOut) else "下载或写入失败"
         await status_message.edit_text(f"保存失败：{detail}。已自动重试 {DOWNLOAD_RETRIES} 次，请稍后重新发送。")
     finally:
-        if started:
-            await tracker.finish()
-        else:
-            await tracker.cancel_waiting()
+        await tracker.remove(task_id)
 
 
 def clean_cache() -> tuple[int, int]:
