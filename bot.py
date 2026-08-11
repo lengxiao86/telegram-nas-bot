@@ -107,6 +107,11 @@ class StateStore:
         rows = self.connection.execute("SELECT * FROM saved_files ORDER BY saved_at DESC LIMIT ?", (limit,)).fetchall()
         return [row for row in rows if Path(row["path"]).is_file()]
 
+    def forget_path(self, path: Path) -> None:
+        """Remove an index entry for a file that was deliberately deleted."""
+        self.connection.execute("DELETE FROM saved_files WHERE path = ?", (str(path),))
+        self.connection.commit()
+
 
 class TransferTracker:
     def __init__(self) -> None:
@@ -159,7 +164,9 @@ async def deny_if_needed(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny_if_needed(update):
         return
-    await update.effective_message.reply_text("把视频发给我，我会保存到 NAS。可用命令：/status、/recent、/dedupe_report")
+    await update.effective_message.reply_text(
+        "把视频发给我，我会保存到 NAS。可用命令：/status、/recent、/dedupe_report、/dedupe_delete"
+    )
 
 
 def recent_lines(store: StateStore, limit: int) -> list[str]:
@@ -172,7 +179,7 @@ def recent_lines(store: StateStore, limit: int) -> list[str]:
     ]
 
 
-def scan_duplicate_videos(root: Path) -> tuple[int, int, list[list[Path]]]:
+def scan_duplicate_videos(root: Path) -> tuple[int, int, list[tuple[str, list[Path]]]]:
     """Return video count, reclaimable bytes, and exact-duplicate file groups."""
     by_size: dict[int, list[Path]] = {}
     video_count = 0
@@ -193,13 +200,17 @@ def scan_duplicate_videos(root: Path) -> tuple[int, int, list[list[Path]]]:
             with suppress(OSError):
                 by_hash.setdefault(file_hash(candidate), []).append(candidate)
 
-    groups = [sorted(group, key=lambda path: (path.stat().st_mtime, str(path))) for group in by_hash.values() if len(group) > 1]
-    groups.sort(key=lambda group: group[0].stat().st_size * (len(group) - 1), reverse=True)
-    reclaimable = sum(group[0].stat().st_size * (len(group) - 1) for group in groups)
+    groups = [
+        (digest, sorted(group, key=lambda path: (path.stat().st_mtime, str(path))))
+        for digest, group in by_hash.items()
+        if len(group) > 1
+    ]
+    groups.sort(key=lambda item: item[1][0].stat().st_size * (len(item[1]) - 1), reverse=True)
+    reclaimable = sum(group[0].stat().st_size * (len(group) - 1) for _, group in groups)
     return video_count, reclaimable, groups
 
 
-def duplicate_report_text(video_count: int, reclaimable: int, groups: list[list[Path]]) -> str:
+def duplicate_report_text(video_count: int, reclaimable: int, groups: list[tuple[str, list[Path]]]) -> str:
     lines = [
         "Telegram NAS Bot - 精确重复视频报告",
         f"扫描目录：{SAVE_DIR}",
@@ -209,12 +220,33 @@ def duplicate_report_text(video_count: int, reclaimable: int, groups: list[list[
         "",
         "说明：依据 SHA-256 文件内容检测；本报告不会移动或删除文件。",
     ]
-    for number, group in enumerate(groups, 1):
+    for number, (_, group) in enumerate(groups, 1):
         original = group[0].relative_to(SAVE_DIR)
         size = readable_size(group[0].stat().st_size)
         lines.extend(["", f"重复组 {number}（每个 {size}）", f"保留建议：{original}"])
         lines.extend(f"重复副本：{path.relative_to(SAVE_DIR)}" for path in group[1:])
     return "\n".join(lines) + "\n"
+
+
+def make_dedupe_plan(groups: list[tuple[str, list[Path]]]) -> list[dict[str, object]]:
+    """Keep enough immutable information to validate files again before deletion."""
+    return [
+        {
+            "sha256": digest,
+            "size": group[0].stat().st_size,
+            "original": str(group[0]),
+            "duplicates": [str(path) for path in group[1:]],
+        }
+        for digest, group in groups
+    ]
+
+
+def is_in_save_dir(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(SAVE_DIR.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def duration_text(seconds: float) -> str:
@@ -278,6 +310,12 @@ async def dedupe_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         progress = await update.effective_message.reply_text("正在扫描 NAS 文件夹中的视频并计算精确指纹，视频较多时可能需要几分钟…")
         try:
             video_count, reclaimable, groups = await asyncio.to_thread(scan_duplicate_videos, SAVE_DIR)
+            context.application.bot_data["dedupe_plan"] = {
+                "created_at": time.time(),
+                "video_count": video_count,
+                "reclaimable": reclaimable,
+                "groups": make_dedupe_plan(groups),
+            }
             report = duplicate_report_text(video_count, reclaimable, groups)
             await progress.edit_text(
                 f"扫描完成：共 {video_count} 个视频，发现 {len(groups)} 组精确重复文件，可释放 {readable_size(reclaimable)}。"
@@ -292,6 +330,82 @@ async def dedupe_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             LOG.exception("Duplicate scan failed")
             await progress.edit_text("去重扫描失败。请查看 NAS 容器日志，并确认保存文件夹可读。")
+
+
+async def dedupe_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for an explicit Telegram confirmation before a permanent delete."""
+    if await deny_if_needed(update):
+        return
+    plan = context.application.bot_data.get("dedupe_plan")
+    queue = await context.application.bot_data["tracker"].snapshot()
+    if queue["active"] or queue["waiting"]:
+        await update.effective_message.reply_text("当前仍有视频在传输或排队。请完成后再执行删除，避免扫描结果过期。")
+        return
+    if not plan or time.time() - plan["created_at"] > 60 * 60:
+        await update.effective_message.reply_text("请先运行 /dedupe_report 完成一次新的扫描；扫描结果仅在 1 小时内可用于删除。")
+        return
+    copies = sum(len(group["duplicates"]) for group in plan["groups"])
+    if not copies:
+        await update.effective_message.reply_text("最近一次扫描没有发现可删除的精确重复视频。")
+        return
+    context.application.bot_data["dedupe_delete_confirmation_until"] = time.time() + 10 * 60
+    await update.effective_message.reply_text(
+        f"准备永久删除 {copies} 个精确重复副本，预计释放 {readable_size(plan['reclaimable'])}。\n"
+        "每组会保留最早保存的一份；删除前会再次核对 SHA-256。\n\n"
+        "如确认，请在 10 分钟内发送：/dedupe_delete_confirm"
+    )
+
+
+async def dedupe_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny_if_needed(update):
+        return
+    plan = context.application.bot_data.get("dedupe_plan")
+    confirmation_until = context.application.bot_data.get("dedupe_delete_confirmation_until", 0)
+    queue = await context.application.bot_data["tracker"].snapshot()
+    if queue["active"] or queue["waiting"]:
+        await update.effective_message.reply_text("当前仍有视频在传输或排队，已取消本次删除确认。")
+        context.application.bot_data.pop("dedupe_delete_confirmation_until", None)
+        return
+    if not plan or time.time() - plan["created_at"] > 60 * 60 or time.time() > confirmation_until:
+        await update.effective_message.reply_text("删除确认已过期。请重新运行 /dedupe_report，然后发送 /dedupe_delete。")
+        return
+
+    status_message = await update.effective_message.reply_text("正在再次核对文件内容，并永久删除重复副本…")
+    store: StateStore = context.application.bot_data["store"]
+    deleted = 0
+    released = 0
+    skipped = 0
+    try:
+        for group in plan["groups"]:
+            original = Path(group["original"])
+            expected_hash = group["sha256"]
+            expected_size = group["size"]
+            if not (is_in_save_dir(original) and original.is_file() and not original.is_symlink() and original.stat().st_size == expected_size):
+                skipped += len(group["duplicates"])
+                continue
+            if await asyncio.to_thread(file_hash, original) != expected_hash:
+                skipped += len(group["duplicates"])
+                continue
+            for raw_path in group["duplicates"]:
+                candidate = Path(raw_path)
+                if not (is_in_save_dir(candidate) and candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size == expected_size):
+                    skipped += 1
+                    continue
+                if await asyncio.to_thread(file_hash, candidate) != expected_hash:
+                    skipped += 1
+                    continue
+                size = candidate.stat().st_size
+                await asyncio.to_thread(candidate.unlink)
+                store.forget_path(candidate)
+                deleted += 1
+                released += size
+        await status_message.edit_text(f"去重完成：已永久删除 {deleted} 个重复视频，释放 {readable_size(released)}。跳过 {skipped} 个未能再次验证的文件。")
+    except Exception:
+        LOG.exception("Duplicate deletion failed")
+        await status_message.edit_text(f"删除过程中发生错误：已删除 {deleted} 个文件，释放 {readable_size(released)}。请查看 NAS 容器日志。")
+    finally:
+        context.application.bot_data.pop("dedupe_delete_confirmation_until", None)
+        context.application.bot_data.pop("dedupe_plan", None)
 
 
 def copy_chunk(source, target) -> int:
@@ -471,6 +585,8 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("recent", recent))
     app.add_handler(CommandHandler("dedupe_report", dedupe_report))
+    app.add_handler(CommandHandler("dedupe_delete", dedupe_delete))
+    app.add_handler(CommandHandler("dedupe_delete_confirm", dedupe_delete_confirm))
     app.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, save_video))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
